@@ -480,16 +480,19 @@
             list.innerHTML = files.map(f => {
                 const icon = f.is_dir ? 'fa-folder' : (f.name.toLowerCase().endsWith('.zip') ? 'fa-file-zipper' : 'fa-file-code');
                 const safe = escapeHtml(f.name);
-                const displayTitle = escapeHtml(f.display_name || f.name.split('/').pop());
-                const description = escapeHtml(f.description || 'أضف وصفًا عربيًا لتوضيح وظيفة هذا الملف.');
+                const originalTitle = escapeHtml(f.name.split('/').pop());
+                const displayTitle = escapeHtml(f.display_name || originalTitle);
+                const categoryLine = displayTitle !== originalTitle ? `<div class="file-category" style="font-size:.78rem;color:#75ded4;line-height:1.5;margin-top:4px;overflow-wrap:anywhere;">التصنيف: ${displayTitle}</div>` : '';
+                const description = escapeHtml(f.description || 'يمكنك كتابة وصف عربي يوضح وظيفة هذا الملف.');
                 return `<div class="file-card" data-file-name="${safe}" data-is-dir="${f.is_dir ? '1' : '0'}" data-display-name="${displayTitle}" data-description="${description}">
                     <div class="file-main">
                         <input type="checkbox" class="file-checkbox file-check" value="${safe}" aria-label="تحديد ${safe}">
                         <div class="file-icon"><i class="fas ${icon}"></i></div>
                         <div class="file-info">
-                            <div class="file-name">${displayTitle}</div>
+                            <div class="file-name" dir="auto">${originalTitle}</div>
+                            ${categoryLine}
                             <div style="font-size:.8rem;color:#a9b7d9;line-height:1.6;margin-top:4px;overflow-wrap:anywhere;">${description}</div>
-                            <div class="file-meta">${f.is_dir ? 'مجلد' : f.size} · الاسم الأصلي: <span dir="ltr" style="overflow-wrap:anywhere;">${safe}</span></div>
+                            <div class="file-meta">${f.is_dir ? 'مجلد' : f.size} · المسار الأصلي: <span dir="ltr" style="overflow-wrap:anywhere;">${safe}</span></div>
                         </div>
                     </div>
                     <div class="file-actions">

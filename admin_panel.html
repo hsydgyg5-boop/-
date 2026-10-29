@@ -167,15 +167,13 @@
             <p style="color:#9ca3cf; margin-bottom: 16px;">مرحباً في لوحة التحكم المركزية. يمكنك مراقبة وإدارة جميع جوانب المنصة.</p>
             <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin:16px 0;padding:14px;border:1px solid rgba(45,122,255,.25);border-radius:16px;background:rgba(45,122,255,.06);">
                 <div style="flex:1;min-width:220px;"><strong style="color:#00e5ff;">نسخة احتياطية كاملة</strong><div style="font-size:.82rem;color:#9ca3cf;margin-top:5px;line-height:1.7;">تصدير قاعدة بيانات المنصة ومجلدات المشاريع وملفات المستخدمين في ZIP واحد للنقل أو الحفظ.</div></div>
-                <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
-                    <button class="btn-primary" onclick="downloadFullMazajiBackup()"><i class="fas fa-file-zipper"></i> تنزيل قاعدة البيانات الكاملة</button>
-                    <input type="file" id="fullBackupRestoreFile" accept=".zip,application/zip" style="display:none" onchange="showSelectedFullBackup()">
-                    <button class="btn-secondary" onclick="document.getElementById('fullBackupRestoreFile').click()"><i class="fas fa-folder-open"></i> اختيار ملف ZIP</button>
-                    <button class="btn-danger" id="restoreFullBackupButton" onclick="restoreFullMazajiBackup()" disabled><i class="fas fa-database"></i> استعادة قاعدة البيانات</button>
+                <button class="btn-primary" onclick="downloadFullMazajiBackup()"><i class="fas fa-file-zipper"></i> تنزيل النسخة الاحتياطية الكاملة</button>
+                <div style="flex-basis:100%;display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:8px;">
+                    <input id="fullBackupRestoreFile" type="file" accept=".zip,application/zip" style="flex:1;min-width:220px;padding:10px;border:1px solid rgba(45,122,255,.3);border-radius:12px;background:#070b15;color:#cbd5e1;" aria-label="اختيار نسخة قاعدة البيانات ZIP">
+                    <button class="btn-primary" style="background:linear-gradient(135deg,#be123c,#7f1d1d);" onclick="restoreFullMazajiBackup()"><i class="fas fa-database"></i> استعادة نسخة ZIP على هذه الاستضافة</button>
                 </div>
+                <div style="flex-basis:100%;font-size:.78rem;color:#fbbf24;line-height:1.7;">الاستعادة تستبدل قاعدة بيانات المنصة وملفات المستخدمين الحالية بعد إنشاء نسخة رجوع تلقائية؛ استخدم فقط ملف النسخة الكاملة الذي نزّلته من مزاجي.</div>
             </div>
-            <div id="selectedFullBackupName" style="font-size:.78rem;color:#9ca3cf;margin:10px 0;">اختر ملف «قاعدة_بيانات_مزاجي_الكاملة.zip» لاستعادة المستخدمين والأرصدة وملفات المشاريع.</div>
-            <div style="font-size:.78rem;color:#fbbf24;margin-bottom:8px;line-height:1.7;">تنبيه: الاستعادة تستبدل البيانات الحالية بالبيانات الموجودة داخل ZIP بعد إنشاء نقطة رجوع تلقائية. تُستعاد المشاريع متوقفة، ويجب تشغيلها يدويًا بعد التحقق.</div>
             <div class="chart-container">
                 <canvas id="userGrowthChart"></canvas>
             </div>
@@ -208,7 +206,7 @@
                 </div>
                 <div class="form-group">
                     <label>الحد الأقصى لملفات المستخدم (افتراضي 10)</label>
-                    <input type="number" id="newUserMaxFiles" placeholder="10" value="10" min="1" max="1000000">
+                    <input type="number" id="newUserMaxFiles" placeholder="10" value="10" min="1" max="2147483647">
                 </div>
                 <div class="form-group">
                     <label>عدد الأيام (الصلاحية)</label>
@@ -220,10 +218,10 @@
 
         <div class="card">
             <div class="card-title"><i class="fas fa-sliders-h"></i> الحد الأقصى لملفات المستخدم</div>
-            <p style="color:#9ca3cf;font-size:.82rem;line-height:1.7;margin-bottom:14px;">هذا الحد يحسب مجموع الملفات داخل مشاريع المستخدم. أمّا عدد المشاريع/السيرفرات التي يستطيع إنشاؤها أو رفع مشروع جديد إليها فهو حد مستقل يُعدّل من عمود «السيرفرات» أدناه؛ مثلًا إذا بقي حد السيرفرات 2 فسيظل زر «رفع ملف وتشغيله تلقائيًا» يسمح بمشروعين فقط.</p>
+            <p style="color:#9ca3cf;font-size:.82rem;line-height:1.7;margin-bottom:14px;">هذا الحد يحسب مجموع الملفات داخل مشاريع المستخدم، ويمكن رفعه إلى أكثر من مليار ملف نظريًا؛ لكن مساحة التخزين وحدود الاستضافة الفعلية تبقى مطبّقة. أمّا عدد المشاريع/السيرفرات التي يستطيع إنشاؤها أو رفع مشروع جديد إليها فهو حد مستقل يُعدّل من عمود «السيرفرات» أدناه؛ مثلًا إذا بقي حد السيرفرات 2 فسيظل زر «رفع ملف وتشغيله تلقائيًا» يسمح بمشروعين فقط.</p>
             <div class="form-row">
                 <div class="form-group"><label for="fileLimitUser">المستخدم</label><select id="fileLimitUser" style="width:100%;padding:12px 16px;background:#070b15;border:1px solid rgba(45,122,255,.4);border-radius:14px;color:#fff;"><option value="">تحميل المستخدمين...</option></select></div>
-                <div class="form-group"><label for="fileLimitValue">الحد الأقصى للملفات</label><input type="number" id="fileLimitValue" min="1" max="1000000" value="10" /></div>
+                <div class="form-group"><label for="fileLimitValue">الحد الأقصى للملفات</label><input type="number" id="fileLimitValue" min="1" max="2147483647" value="10" /></div>
             </div>
             <button class="btn-primary" onclick="saveSelectedUserFileLimit()"><i class="fas fa-save"></i> حفظ حد الملفات</button>
         </div>
@@ -647,7 +645,7 @@
                     </td>
                     <td style="min-width:170px;">
                         <div style="display:flex;gap:6px;align-items:center;">
-                            <input type="number" min="1" max="1000000" value="${Number(u.max_files || 10)}" aria-label="حد ملفات ${escapeHtml(u.username)}" style="width:86px;padding:7px;background:#070b15;border:1px solid rgba(45,122,255,.4);border-radius:10px;color:#fff;" />
+                            <input type="number" min="1" max="2147483647" value="${Number(u.max_files || 10)}" aria-label="حد ملفات ${escapeHtml(u.username)}" style="width:118px;padding:7px;background:#070b15;border:1px solid rgba(45,122,255,.4);border-radius:10px;color:#fff;" />
                             <button class="btn-success" data-user="${escapeHtml(u.username)}" onclick="updateUserMaxFiles(this.dataset.user,this.parentElement.querySelector('input').value)" style="padding:7px 10px;">حفظ</button>
                         </div>
                         <button class="btn-secondary" data-user="${escapeHtml(u.username)}" onclick="openAdminUserServers(this.dataset.user)" style="margin-top:6px;padding:6px 10px;"><i class="fas fa-server"></i> سيرفرات وملفات</button>
@@ -960,46 +958,30 @@
         window.location.href = '/api/admin/backup/full';
     }
 
-    function showSelectedFullBackup() {
-        const input = document.getElementById('fullBackupRestoreFile');
-        const button = document.getElementById('restoreFullBackupButton');
-        const label = document.getElementById('selectedFullBackupName');
-        const file = input.files && input.files[0];
-        button.disabled = !file;
-        label.textContent = file ? `الملف المحدد: ${file.name} (${(file.size / (1024 * 1024)).toFixed(2)} MB)` : 'لم يتم اختيار ملف بعد.';
-    }
-
     async function restoreFullMazajiBackup() {
         const input = document.getElementById('fullBackupRestoreFile');
-        const button = document.getElementById('restoreFullBackupButton');
-        const file = input.files && input.files[0];
-        if (!file) { showToast('اختر ملف النسخة الاحتياطية أولاً', 'error'); return; }
-        if (!file.name.toLowerCase().endsWith('.zip')) { showToast('يجب اختيار ملف ZIP', 'error'); return; }
-        const proceed = confirm('تحذير مهم: ستُستبدل قاعدة بيانات الاستضافة وملفات المستخدمين والمشاريع بالمحتوى الموجود داخل الملف. سينشئ النظام نسخة رجوع تلقائية قبل التغيير، وستصبح المشاريع متوقفة بعد الاستعادة. هل تريد المتابعة؟');
-        if (!proceed) return;
+        const file = input && input.files && input.files[0];
+        if (!file) return showToast('اختر ملف النسخة الاحتياطية ZIP أولاً', 'error');
+        if (!file.name.toLowerCase().endsWith('.zip')) return showToast('يجب اختيار ملف ZIP', 'error');
+        if (!confirm('تحذير: ستتوقف المشاريع الحالية وسيتم استبدال قاعدة البيانات وملفات المستخدمين بمحتويات النسخة. سيحاول النظام إنشاء نسخة رجوع تلقائية قبل التغيير. هل تريد المتابعة؟')) return;
         const form = new FormData();
-        form.append('backup_file', file, file.name);
-        button.disabled = true;
-        button.innerHTML = '<i class="fas fa-spinner fa-spin"></i> جارٍ التحقق والاستعادة...';
+        form.append('file', file, file.name);
         try {
-            const response = await fetch('/api/admin/backup/restore', { method: 'POST', body: form });
-            let result;
-            try { result = await response.json(); } catch (_) { throw new Error('استجابة غير مفهومة من الخادم'); }
-            if (!response.ok || !result.success) throw new Error(result.message || 'فشلت استعادة قاعدة البيانات');
-            showToast(`تمت الاستعادة: ${result.users_restored} مستخدم و${result.servers_restored} مشروع`, 'success');
-            document.getElementById('selectedFullBackupName').textContent = 'اكتملت الاستعادة بنجاح. جارٍ تحديث لوحة الإدارة...';
+            showToast('جارٍ التحقق من النسخة واستعادتها...', 'info');
+            const response = await fetch('/api/admin/backup/restore', {method:'POST', body:form});
+            const data = await response.json();
+            if (!response.ok || !data.success) throw new Error(data.message || 'فشلت استعادة النسخة');
+            showToast(data.message || 'تمت استعادة النسخة الاحتياطية', 'success');
             setTimeout(() => window.location.reload(), 1200);
         } catch (error) {
-            showToast(error.message || 'تعذر استعادة قاعدة البيانات', 'error');
-            button.disabled = false;
-            button.innerHTML = '<i class="fas fa-database"></i> استعادة قاعدة البيانات';
+            showToast(error.message || 'تعذر استعادة النسخة الاحتياطية', 'error');
         }
     }
 
     async function updateUserMaxFiles(username, value) {
         const max_files = Number.parseInt(value, 10);
-        if (!Number.isInteger(max_files) || max_files < 1 || max_files > 1000000) {
-            showToast('أدخل حدًا صحيحًا بين 1 و1,000,000 ملف', 'error');
+        if (!Number.isInteger(max_files) || max_files < 1 || max_files > 2147483647) {
+            showToast('أدخل حدًا صحيحًا بين 1 و2,147,483,647 ملف', 'error');
             return;
         }
         try {

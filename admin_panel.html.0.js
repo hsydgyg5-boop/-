@@ -157,7 +157,7 @@
                     </td>
                     <td style="min-width:170px;">
                         <div style="display:flex;gap:6px;align-items:center;">
-                            <input type="number" min="1" max="1000000" value="${Number(u.max_files || 10)}" aria-label="حد ملفات ${escapeHtml(u.username)}" style="width:86px;padding:7px;background:#070b15;border:1px solid rgba(45,122,255,.4);border-radius:10px;color:#fff;" />
+                            <input type="number" min="1" max="2147483647" value="${Number(u.max_files || 10)}" aria-label="حد ملفات ${escapeHtml(u.username)}" style="width:118px;padding:7px;background:#070b15;border:1px solid rgba(45,122,255,.4);border-radius:10px;color:#fff;" />
                             <button class="btn-success" data-user="${escapeHtml(u.username)}" onclick="updateUserMaxFiles(this.dataset.user,this.parentElement.querySelector('input').value)" style="padding:7px 10px;">حفظ</button>
                         </div>
                         <button class="btn-secondary" data-user="${escapeHtml(u.username)}" onclick="openAdminUserServers(this.dataset.user)" style="margin-top:6px;padding:6px 10px;"><i class="fas fa-server"></i> سيرفرات وملفات</button>
@@ -470,10 +470,30 @@
         window.location.href = '/api/admin/backup/full';
     }
 
+    async function restoreFullMazajiBackup() {
+        const input = document.getElementById('fullBackupRestoreFile');
+        const file = input && input.files && input.files[0];
+        if (!file) return showToast('اختر ملف النسخة الاحتياطية ZIP أولاً', 'error');
+        if (!file.name.toLowerCase().endsWith('.zip')) return showToast('يجب اختيار ملف ZIP', 'error');
+        if (!confirm('تحذير: ستتوقف المشاريع الحالية وسيتم استبدال قاعدة البيانات وملفات المستخدمين بمحتويات النسخة. سيحاول النظام إنشاء نسخة رجوع تلقائية قبل التغيير. هل تريد المتابعة؟')) return;
+        const form = new FormData();
+        form.append('file', file, file.name);
+        try {
+            showToast('جارٍ التحقق من النسخة واستعادتها...', 'info');
+            const response = await fetch('/api/admin/backup/restore', {method:'POST', body:form});
+            const data = await response.json();
+            if (!response.ok || !data.success) throw new Error(data.message || 'فشلت استعادة النسخة');
+            showToast(data.message || 'تمت استعادة النسخة الاحتياطية', 'success');
+            setTimeout(() => window.location.reload(), 1200);
+        } catch (error) {
+            showToast(error.message || 'تعذر استعادة النسخة الاحتياطية', 'error');
+        }
+    }
+
     async function updateUserMaxFiles(username, value) {
         const max_files = Number.parseInt(value, 10);
-        if (!Number.isInteger(max_files) || max_files < 1 || max_files > 1000000) {
-            showToast('أدخل حدًا صحيحًا بين 1 و1,000,000 ملف', 'error');
+        if (!Number.isInteger(max_files) || max_files < 1 || max_files > 2147483647) {
+            showToast('أدخل حدًا صحيحًا بين 1 و2,147,483,647 ملف', 'error');
             return;
         }
         try {

@@ -18,7 +18,6 @@ import tempfile
 import ast
 import shlex
 import unicodedata
-import stat
 from datetime import datetime, timedelta
 from pathlib import Path
 from flask import Flask, send_from_directory, send_file, request, jsonify, session, redirect, make_response, Response
@@ -158,6 +157,8 @@ def get_pending_users_list():
 
 # ============== قاعدة البيانات ==============
 DB_FILE = os.path.join(DATA_DIR, "db.json")
+# حد عددي كبير قابل للضبط؛ موارد الاستضافة ومساحة التخزين الفعلية تظل مطبقة.
+MAX_USER_FILES_LIMIT = 2_147_483_647
 BUNDLED_DB_FILE = os.path.join(BASE_DIR, "db.json")
 
 def load_db():
@@ -184,7 +185,7 @@ def load_db():
                 }
                 data.setdefault("users", {})
                 for existing_name, existing_user in data["users"].items():
-                    existing_user.setdefault("max_files", 1000000 if existing_user.get("is_admin") or existing_name == ADMIN_USERNAME else 10)
+                    existing_user.setdefault("max_files", MAX_USER_FILES_LIMIT if existing_user.get("is_admin") or existing_name == ADMIN_USERNAME else 10)
                 data.setdefault("servers", {})
                 data.setdefault("logs", [])
                 data.setdefault("plans", {})
@@ -200,7 +201,7 @@ def load_db():
                         "is_admin": True,
                         "created_at": str(datetime.now()),
                         "max_servers": 999999,
-                        "max_files": 1000000,
+                        "max_files": MAX_USER_FILES_LIMIT,
                         "expiry_days": 3650,
                         "last_login": None,
                         "telegram_id": None,
@@ -257,7 +258,7 @@ def load_db():
                 "is_admin": True,
                 "created_at": str(datetime.now()),
                 "max_servers": 999999,
-                "max_files": 1000000,
+                "max_files": MAX_USER_FILES_LIMIT,
                 "expiry_days": 3650,
                 "last_login": None,
                 "telegram_id": None,
@@ -854,23 +855,126 @@ def detect_python_packages(srv_path):
 
 
 def ensure_python_environment(srv_path, log_file=None, strict=True):
-    """Create a private venv, infer missing imports, install requirements, and verify imports."""
+    """Create/recover a project venv, bootstrap pip if missing, install requirements, and verify consistency."""
+    srv_path = os.path.abspath(srv_path)
+
     def log(message):
         if log_file:
-            log_file.write(message + "\n")
+            log_file.write(str(message) + "\n")
             log_file.flush()
+
+    def run_command(command, timeout=120, cwd=None):
+        try:
+            result = subprocess.run(
+                command, cwd=cwd or srv_path, stdout=log_file or subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, timeout=timeout, check=False
+            )
+            if not log_file and result.stdout:
+                log(result.stdout.rstrip())
+            return result
+        except subprocess.TimeoutExpired:
+            log("⏱️ انتهت مهلة الأمر: " + " ".join(map(str, command)))
+            return None
+        except Exception as exc:
+            log(f"تعذر تنفيذ الأمر {' '.join(map(str, command))}: {exc}")
+            return None
 
     venv_dir = os.path.join(srv_path, ".venv")
     venv_python = os.path.join(venv_dir, "Scripts", "python.exe") if os.name == "nt" else os.path.join(venv_dir, "bin", "python")
-    venv_created_or_missing = not os.path.exists(venv_python)
     try:
-        if venv_created_or_missing:
+        os.makedirs(srv_path, exist_ok=True)
+        if os.path.islink(venv_dir):
+            raise RuntimeError("مجلد .venv رابط رمزي غير آمن؛ أزله يدويًا ثم أعد تشغيل المشروع")
+
+        # Detect stale/partial venvs, especially the user-reported 'No module named pip'.
+        recreate_venv = not os.path.isfile(venv_python)
+        if not recreate_venv:
+            probe = run_command([venv_python, "-c", "import sys; print(sys.executable)"], timeout=15)
+            recreate_venv = probe is None or probe.returncode != 0
+            if recreate_venv:
+                log("⚠️ بيئة Python الحالية غير صالحة؛ ستُعاد تهيئتها")
+        if recreate_venv:
+            if os.path.exists(venv_dir):
+                real_root = os.path.realpath(srv_path)
+                real_venv = os.path.realpath(venv_dir)
+                if os.path.commonpath([real_root, real_venv]) != real_root or real_venv == real_root:
+                    raise RuntimeError("مسار البيئة الافتراضية خارج المشروع أو غير آمن")
+                shutil.rmtree(venv_dir, ignore_errors=False)
             log("\n🧰 إنشاء بيئة Python خاصة بالمشروع...")
-            result = subprocess.run([sys.executable, "-m", "venv", venv_dir], cwd=srv_path,
-                                    stdout=log_file or subprocess.DEVNULL, stderr=subprocess.STDOUT,
-                                    timeout=120, check=False)
-            if result.returncode != 0 or not os.path.exists(venv_python):
-                raise RuntimeError("تعذر إنشاء البيئة الافتراضية. تحقق من أن الاستضافة تتضمن دعم venv وصلاحية الكتابة.")
+            create = run_command([sys.executable, "-m", "venv", venv_dir], timeout=180)
+            if create is None or create.returncode != 0 or not os.path.isfile(venv_python):
+                partial_venv_ok = False
+                if os.path.isfile(venv_python):
+                    partial_probe = run_command([venv_python, "-c", "import sys; print(sys.executable)"], timeout=15)
+                    partial_venv_ok = partial_probe is not None and partial_probe.returncode == 0
+                if partial_venv_ok:
+                    log("⚠️ أنشأت الاستضافة Python بدون pip؛ سنحاول إكمال pip داخل البيئة بدل حذفها")
+                else:
+                    log("⚠️ فشل إنشاء venv القياسي؛ تجربة virtualenv إن كانت متوفرة...")
+                    virtualenv_cmd = shutil.which("virtualenv")
+                    if virtualenv_cmd:
+                        create = run_command([virtualenv_cmd, "--clear", venv_dir], timeout=180)
+                    else:
+                        create = run_command([sys.executable, "-m", "virtualenv", "--clear", venv_dir], timeout=180)
+                    if create is None or create.returncode != 0 or not os.path.isfile(venv_python):
+                        raise RuntimeError("تعذر إنشاء البيئة الافتراضية: الاستضافة قد تفتقد venv/virtualenv أو صلاحية الكتابة")
+
+        def pip_works():
+            check = run_command([venv_python, "-m", "pip", "--version"], timeout=20)
+            return check is not None and check.returncode == 0
+
+        pip_bootstrap_error = ""
+        if not pip_works():
+            log("⚠️ البيئة موجودة لكن pip غير موجود — محاولة استعادته عبر ensurepip...")
+            bootstrapped = run_command([venv_python, "-m", "ensurepip", "--upgrade", "--default-pip"], timeout=180)
+            if not pip_works():
+                log("⚠️ ensurepip لم يُصلح البيئة؛ محاولة استخدام pip النظام لتجهيز بيئة المشروع...")
+                system_pip = run_command([sys.executable, "-m", "pip", "--version"], timeout=20)
+                if system_pip is not None and system_pip.returncode == 0:
+                    run_command([sys.executable, "-m", "pip", "--python", venv_python,
+                                 "install", "--upgrade", "pip", "setuptools", "wheel",
+                                 "--disable-pip-version-check", "--no-input"], timeout=300)
+                if not pip_works():
+                    pip_cmd = shutil.which("pip3") or shutil.which("pip")
+                    if pip_cmd:
+                        run_command([pip_cmd, "--python", venv_python, "install", "--upgrade", "pip", "setuptools", "wheel"], timeout=300)
+                if not pip_works():
+                    # Compatibility fallback for older system pip versions that do not support `pip --python`.
+                    # Install the pip bootstrap packages into this venv's own site-packages directory.
+                    try:
+                        site_result = subprocess.run(
+                            [venv_python, "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+                            cwd=srv_path, capture_output=True, text=True, timeout=20, check=False
+                        )
+                        site_packages = site_result.stdout.strip() if site_result.returncode == 0 else ""
+                        real_venv = os.path.realpath(venv_dir)
+                        real_site = os.path.realpath(site_packages) if site_packages else ""
+                        if real_site and os.path.commonpath([real_venv, real_site]) == real_venv:
+                            system_pip = run_command([sys.executable, "-m", "pip", "--version"], timeout=20)
+                            if system_pip is not None and system_pip.returncode == 0:
+                                os.makedirs(real_site, exist_ok=True)
+                                log("🧰 محاولة تجهيز pip بتثبيت أدواته مباشرة داخل site-packages للبيئة الافتراضية...")
+                                run_command([sys.executable, "-m", "pip", "install", "--upgrade", "--ignore-installed",
+                                             "--target", real_site, "pip", "setuptools", "wheel",
+                                             "--disable-pip-version-check", "--no-input"], timeout=300)
+                    except Exception as bootstrap_exc:
+                        log(f"تعذر مسار تجهيز pip البديل: {bootstrap_exc}")
+                if not pip_works():
+                    log("⚠️ محاولة أخيرة لإعادة بناء البيئة باستخدام virtualenv لإضافة pip...")
+                    virtualenv_cmd = shutil.which("virtualenv")
+                    if virtualenv_cmd:
+                        run_command([virtualenv_cmd, "--clear", venv_dir], timeout=300)
+                    else:
+                        run_command([sys.executable, "-m", "virtualenv", "--clear", venv_dir], timeout=300)
+                if not pip_works():
+                    pip_bootstrap_error = "لم يمكن تجهيز pip داخل .venv؛ الاستضافة لا توفر ensurepip أو pip نظامًا صالحًا"
+                    if bootstrapped is None:
+                        pip_bootstrap_error += "، وتعذر تنفيذ ensurepip"
+                    log("⚠️ " + pip_bootstrap_error)
+                else:
+                    log("✅ تم إصلاح pip داخل البيئة الافتراضية")
+            else:
+                log("✅ تم إصلاح pip داخل البيئة الافتراضية")
 
         req_file = os.path.join(srv_path, "requirements.txt")
         inferred = detect_python_packages(srv_path)
@@ -925,39 +1029,30 @@ def ensure_python_environment(srv_path, log_file=None, strict=True):
             installed_hash = ""
 
         if has_requirements:
-            if installed_hash != req_hash or venv_created_or_missing:
-                log("📦 تثبيت المكتبات المطلوبة داخل بيئة المشروع...")
-            else:
-                log("🔎 إعادة التحقق من مكتبات requirements.txt وإصلاح أي حزمة مفقودة...")
+            if not pip_works():
+                raise RuntimeError(pip_bootstrap_error or "لا يعمل pip داخل .venv ولا يمكن تثبيت المكتبات المطلوبة")
+            log("📦 تثبيت/التحقق من المكتبات المطلوبة داخل بيئة المشروع...")
             cmd = [venv_python, "-m", "pip", "install", "--disable-pip-version-check", "--no-input", "-r", req_file]
-            result = subprocess.run(cmd, cwd=srv_path, stdout=log_file or subprocess.DEVNULL,
-                                    stderr=subprocess.STDOUT, timeout=600, check=False)
-            if result.returncode != 0:
-                log("⚠️ فشل التثبيت الأول؛ محاولة تحديث أدوات pip وإعادة المحاولة مرة واحدة...")
-                upgrade = subprocess.run([venv_python, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel", "--disable-pip-version-check"],
-                                         cwd=srv_path, stdout=log_file or subprocess.DEVNULL,
-                                         stderr=subprocess.STDOUT, timeout=180, check=False)
-                if upgrade.returncode == 0:
-                    result = subprocess.run(cmd, cwd=srv_path, stdout=log_file or subprocess.DEVNULL,
-                                            stderr=subprocess.STDOUT, timeout=600, check=False)
-            if result.returncode != 0:
-                log("❌ فشل تثبيت المكتبات. افحص اسم الحزمة وإصدار Python والاتصال بالإنترنت ورسائل pip أعلاه.")
-                raise RuntimeError("فشل تثبيت مكتبات Python؛ راجع سجل التثبيت لمعرفة الحزمة والسبب المحدد.")
+            result = run_command(cmd, timeout=900)
+            if result is None or result.returncode != 0:
+                log("⚠️ فشل التثبيت الأول؛ تحديث أدوات pip ثم إعادة المحاولة...")
+                upgrade = run_command([venv_python, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel", "--disable-pip-version-check", "--no-input"], timeout=300)
+                if upgrade is not None and upgrade.returncode == 0:
+                    result = run_command(cmd, timeout=900)
+            if result is None or result.returncode != 0:
+                log("❌ فشل تثبيت مكتبات Python. راجع آخر رسالة pip؛ قد تكون الحزمة غير متوافقة مع إصدار Python أو أن مستودع الحزم غير متاح.")
+                raise RuntimeError("فشل تثبيت مكتبات Python؛ راجع سجل التشغيل لمعرفة الحزمة والسبب المحدد")
             Path(stamp_path).write_text(req_hash, encoding="utf-8")
             log("✅ تم تثبيت المكتبات بنجاح")
         else:
             log("ℹ️ لم تُكتشف مكتبات خارجية مطلوبة لهذا المشروع")
 
-        # Confirm pip/venv is usable. Import failures from the app itself remain visible at startup.
-        check = subprocess.run([venv_python, "-m", "pip", "--version"], cwd=srv_path,
-                               stdout=log_file or subprocess.DEVNULL, stderr=subprocess.STDOUT, timeout=30, check=False)
-        if check.returncode != 0:
-            raise RuntimeError("بيئة Python أُنشئت لكن pip لا يعمل داخلها")
         if has_requirements:
-            consistency = subprocess.run([venv_python, "-m", "pip", "check"], cwd=srv_path,
-                                         stdout=log_file or subprocess.DEVNULL, stderr=subprocess.STDOUT,
-                                         timeout=60, check=False)
-            if consistency.returncode != 0:
+            check = run_command([venv_python, "-m", "pip", "--version"], timeout=30)
+            if check is None or check.returncode != 0:
+                raise RuntimeError("بيئة Python أُنشئت لكن pip لا يعمل داخلها")
+            consistency = run_command([venv_python, "-m", "pip", "check"], timeout=90)
+            if consistency is None or consistency.returncode != 0:
                 log("❌ فحص توافق المكتبات وجد تعارضًا أو اعتمادًا مفقودًا. راجع مخرجات pip check أعلاه.")
                 raise RuntimeError("المكتبات مثبتة لكن فحص التوافق فشل؛ راجع سجل التشغيل للتفاصيل")
             log("✅ اجتاز فحص توافق المكتبات pip check")
@@ -967,7 +1062,6 @@ def ensure_python_environment(srv_path, log_file=None, strict=True):
         if strict:
             raise
         return sys.executable
-
 
 def auto_install_deps(srv_path: str, server_type: str, log_file):
     """Install dependencies and raise on failure so the process is not started half-configured."""
@@ -1401,18 +1495,52 @@ def _default_file_display_info(relative_name, is_dir=False, full_path=None):
     json_description = _json_file_description(full_path) if ext.lower() == ".json" else ""
 
     if is_dir:
-        if lower in {"بيانات_البوتات", "بيانات البوتات", "bot_data", "bots_data", "botdata", "data"}:
-            return ("مجلد بيانات البوت", "مجلد لتجميع ملفات بيانات البوت. راجع الملفات بداخله لمعرفة تفاصيل البيانات المحفوظة.")
-        if lower in {"database", "databases", "db"}:
-            return ("مجلد قاعدة البيانات", "مجلد مخصص لملفات قواعد البيانات أو نسخها الاحتياطية.")
+        database_named = lower in {"database", "databases", "db", "bot_data", "bots_data", "botdata", "user_data", "users_data", "بيانات_البوتات", "بيانات البوتات"} or "database" in lower or lower.endswith("_db") or lower.startswith("db_")
+        data_named = lower in {"data", "storage", "factory_storage", "user_data", "botdata"} or lower.endswith("_storage") or lower.endswith("_data") or lower.startswith("data_")
+        contains_database = False
+        try:
+            for entry in os.scandir(full_path or ""):
+                if entry.is_file(follow_symlinks=False):
+                    child = entry.name.casefold()
+                    child_ext = os.path.splitext(child)[1]
+                    if child in {"db.json", "database.json", "bot_data.json", "bots_data.json", "users.json", "users_data.json", "database.db", "data.db", "bot.db", "users.db", "balances.json", "balance.json", "wallets.json", "points.json", "services.json", "orders.json", "transactions.json"} or child_ext in {".sqlite", ".sqlite3", ".db"}:
+                        contains_database = True
+                        break
+        except (OSError, TypeError):
+            pass
+        if database_named or contains_database:
+            return ("مجلد قاعدة البيانات", "مجلد يضم ملفات قاعدة بيانات أو ملفات بيانات مرتبطة بها. الاسم والمسار الأصليان محفوظان كما هما.")
+        if lower.endswith("_storage"):
+            return ("مجلد بيانات البوت / قاعدة البيانات", "مجلد تخزين المشروع؛ قد يضم قواعد البيانات وبيانات البوت المحفوظة. الاسم والمسار الأصليان محفوظان كما هما.")
+        if data_named:
+            return ("مجلد بيانات المشروع", "مجلد بيانات/تخزين للمشروع. افتحه لمراجعة الملفات المحفوظة؛ الاسم والمسار الأصليان لا يتغيران.")
         if lower in {"config", "configs", "settings"}:
             return ("مجلد الإعدادات", "يحتوي غالبًا على ملفات إعدادات المشروع.")
         return ("مجلد المشروع", "مجلد فرعي داخل المشروع. الاسم والمسار الأصليان محفوظان كما هما.")
 
-    if lower in {"bots_data.json", "bot_data.json", "database.json", "db.json", "database.db", "data.db", "database.sqlite", "database.sqlite3", "bot.db", "users.db"} or ext.lower() in {".sqlite", ".sqlite3"}:
-        return ("قاعدة بيانات البوت", json_description or "ملف بيانات محفوظ. قد يحتوي على مستخدمين أو إعدادات أو سجلات بحسب طريقة كتابة البوت؛ لا يتم تغيير محتواه أو اسمه الأصلي.")
-    if lower in {"users.json", "user_data.json", "users_data.json"}:
-        return ("بيانات المستخدمين", json_description or "ملف يُستخدم غالبًا لحفظ سجلات المستخدمين. افحص بنية البيانات داخله للتأكد من الحقول الموجودة.")
+    named_data_files = {
+        "db.json": "قاعدة بيانات البوت", "database.json": "قاعدة بيانات البوت",
+        "bot_data.json": "قاعدة بيانات البوت", "bots_data.json": "قاعدة بيانات البوت",
+        "database.db": "قاعدة بيانات البوت", "data.db": "قاعدة بيانات البوت",
+        "bot.db": "قاعدة بيانات البوت", "users.db": "قاعدة بيانات البوت",
+        "accounts.db": "قاعدة بيانات البوت", "database.sqlite": "قاعدة بيانات البوت",
+        "database.sqlite3": "قاعدة بيانات البوت", "bot_data.sqlite": "قاعدة بيانات البوت",
+        "users.json": "بيانات المستخدمين", "user.json": "بيانات المستخدمين",
+        "user_data.json": "بيانات المستخدمين", "users_data.json": "بيانات المستخدمين",
+        "accounts.json": "بيانات الحسابات", "balance.json": "بيانات الأرصدة",
+        "balances.json": "بيانات الأرصدة", "wallet.json": "بيانات الأرصدة",
+        "wallets.json": "بيانات الأرصدة", "points.json": "بيانات النقاط",
+        "services.json": "بيانات الخدمات", "orders.json": "بيانات الطلبات",
+        "transactions.json": "سجل المعاملات", "payments.json": "بيانات المدفوعات",
+        "subscriptions.json": "بيانات الاشتراكات", "referrals.json": "بيانات الإحالات",
+        "rewards.json": "بيانات المكافآت", "history.json": "سجل البيانات",
+        "data.json": "بيانات المشروع", "storage.json": "بيانات المشروع"
+    }
+    if lower in named_data_files:
+        label = named_data_files[lower]
+        return (label, json_description or "ملف بيانات محفوظ؛ تم إبقاء الاسم والمحتوى الفعليين دون تغيير.")
+    if ext.lower() in {".sqlite", ".sqlite3", ".db"}:
+        return ("قاعدة بيانات البوت", json_description or "ملف قاعدة بيانات محفوظ؛ الاسم والمسار الأصليان كما هما.")
     if lower in {"config.json", "settings.json", "config.py", "settings.py", ".env", "example.env"} or lower.endswith(".env"):
         return ("إعدادات المشروع", "قد يحتوي على إعدادات تشغيل أو مفاتيح سرية؛ لا تشاركه علنًا.")
     if lower in {"requirements.txt", "pyproject.toml", "pipfile"}:
@@ -1471,7 +1599,7 @@ def user_max_files(user_or_username):
     """Maximum number of user project files. New/legacy users default to 10."""
     user = db.get("users", {}).get(user_or_username, {}) if isinstance(user_or_username, str) else (user_or_username or {})
     try:
-        return max(1, min(int(user.get("max_files", 10)), 1000000))
+        return max(1, min(int(user.get("max_files", 10)), MAX_USER_FILES_LIMIT))
     except (TypeError, ValueError):
         return 10
 
@@ -1990,7 +2118,7 @@ def admin_create_user():
     password = str(data.get("password", "")).strip()
     try:
         max_servers = max(1, min(int(data.get("max_servers", 2)), 1000000))
-        max_files = max(1, min(int(data.get("max_files", 10)), 1000000))
+        max_files = max(1, min(int(data.get("max_files", 10)), MAX_USER_FILES_LIMIT))
         expiry_days = max(1, min(int(data.get("expiry_days", 365)), 36500))
     except (TypeError, ValueError):
         return jsonify({"success": False, "message": "قيم الحدود والمدة يجب أن تكون أرقامًا صحيحة"}), 400
@@ -2065,7 +2193,7 @@ def admin_update_user():
     updates = {}
     numeric_limits = {
         "max_servers": (1, 1000000, "حد السيرفرات"),
-        "max_files": (1, 1000000, "حد الملفات"),
+        "max_files": (1, MAX_USER_FILES_LIMIT, "حد الملفات"),
         "expiry_days": (1, 36500, "مدة الحساب"),
         "storage_limit": (0, 10**15, "سعة التخزين"),
     }
@@ -3347,337 +3475,6 @@ def export_user_server_backup(folder):
         return jsonify({"success": False, "message": f"تعذر إنشاء النسخة الاحتياطية: {exc}"}), 500
 
 
-# حدود الاستعادة: حماية من أرشيفات ZIP التالفة أو المضغوطة بشكل مفرط.
-MAX_FULL_BACKUP_ARCHIVE_BYTES = 500 * 1024 * 1024
-MAX_FULL_BACKUP_UNCOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024
-MAX_FULL_BACKUP_MEMBERS = 100_000
-MAX_FULL_BACKUP_DB_JSON_BYTES = 100 * 1024 * 1024
-FULL_BACKUP_MANIFEST = "MAZAGI_FULL_BACKUP_MANIFEST.json"
-FULL_BACKUP_README = "MAZAGI_FULL_BACKUP_README_AR.txt"
-INTERNAL_PRE_RESTORE_BACKUP = os.path.join("backups", "pre_restore_latest.zip")
-
-
-def _normalize_backup_member_name(raw_name):
-    """Return a safe normalized relative ZIP path, or None if unsafe."""
-    if not isinstance(raw_name, str) or not raw_name or "\x00" in raw_name:
-        return None
-    raw_name = unicodedata.normalize("NFC", raw_name.replace("\\", "/"))
-    if raw_name.startswith("/") or re.match(r"^[A-Za-z]:", raw_name):
-        return None
-    is_dir = raw_name.endswith("/")
-    parts = raw_name.rstrip("/").split("/")
-    if not parts or any(part in ("", ".", "..") for part in parts):
-        return None
-    if any(any(ord(ch) < 32 or ord(ch) == 127 for ch in part) for part in parts):
-        return None
-    normalized = "/".join(parts)
-    # The app's secret is never imported from an archive. This file is managed per deployment.
-    if parts[0].casefold() == ".session_secret":
-        return None
-    return normalized + ("/" if is_dir else "")
-
-
-def _inspect_full_backup_zip(zip_file):
-    """Validate archive paths, size bounds, manifest and database before touching live data."""
-    try:
-        archive = zipfile.ZipFile(zip_file, "r")
-    except (zipfile.BadZipFile, OSError) as exc:
-        raise ValueError("الملف ليس أرشيف ZIP صالحًا") from exc
-
-    with archive:
-        infos = archive.infolist()
-        if not infos or len(infos) > MAX_FULL_BACKUP_MEMBERS:
-            raise ValueError("عدد ملفات النسخة الاحتياطية غير صالح أو يتجاوز الحد المسموح")
-
-        normalized_infos = []
-        seen = set()
-        file_nodes = set()
-        all_nodes = set()
-        uncompressed_total = 0
-        for info in infos:
-            normalized = _normalize_backup_member_name(info.filename)
-            if normalized is None:
-                # Do not silently accept a user-supplied deployment secret.
-                if unicodedata.normalize("NFC", info.filename.replace("\\", "/")).strip("/").casefold() == ".session_secret":
-                    continue
-                raise ValueError("يحتوي ZIP على اسم ملف أو مسار غير آمن")
-            is_dir = normalized.endswith("/") or info.is_dir()
-            rel = normalized.rstrip("/")
-            key = rel.casefold()
-            if key in seen:
-                raise ValueError("يحتوي ZIP على أسماء ملفات مكررة")
-            seen.add(key)
-            mode = (info.external_attr >> 16) & 0xFFFF
-            file_type = stat.S_IFMT(mode)
-            if file_type == stat.S_IFLNK:
-                raise ValueError("لا يُسمح بروابط رمزية داخل النسخة الاحتياطية")
-            if file_type and file_type not in (stat.S_IFREG, stat.S_IFDIR):
-                raise ValueError("يحتوي ZIP على نوع ملف غير مدعوم")
-            if info.flag_bits & 0x1:
-                raise ValueError("النسخ الاحتياطية المشفرة بكلمة مرور غير مدعومة")
-            if info.file_size < 0 or info.file_size > MAX_FULL_BACKUP_UNCOMPRESSED_BYTES:
-                raise ValueError("حجم أحد الملفات داخل النسخة غير مسموح")
-            uncompressed_total += info.file_size
-            if uncompressed_total > MAX_FULL_BACKUP_UNCOMPRESSED_BYTES:
-                raise ValueError("حجم البيانات بعد فك الضغط يتجاوز 2 جيجابايت")
-            all_nodes.add(key)
-            if not is_dir:
-                file_nodes.add(key)
-            normalized_infos.append((info, rel, is_dir))
-
-        # Reject file/directory collisions such as a file named a and another member a/b.
-        for _, rel, is_dir in normalized_infos:
-            parts = rel.split("/")
-            for index in range(1, len(parts)):
-                prefix = "/".join(parts[:index]).casefold()
-                if prefix in file_nodes:
-                    raise ValueError("هيكل ZIP متعارض: ملف مستخدم كمجلد")
-            if not is_dir and any(node.startswith(rel.casefold() + "/") for node in all_nodes):
-                raise ValueError("هيكل ZIP متعارض: ملف مستخدم كمجلد")
-
-        root_files = {rel.casefold(): info for info, rel, is_dir in normalized_infos if not is_dir and "/" not in rel}
-        manifest_info = root_files.get(FULL_BACKUP_MANIFEST.casefold())
-        db_info = root_files.get("db.json")
-        if not manifest_info or not db_info:
-            raise ValueError("هذه ليست نسخة مزاجي الكاملة: ملف البيان أو db.json غير موجود")
-        if manifest_info.file_size > 2 * 1024 * 1024:
-            raise ValueError("ملف وصف النسخة الاحتياطية أكبر من الحد المسموح")
-        if db_info.file_size > MAX_FULL_BACKUP_DB_JSON_BYTES:
-            raise ValueError("حجم db.json أكبر من 100 ميجابايت؛ قسّم البيانات أو تواصل مع الدعم قبل الاستعادة")
-        try:
-            manifest = json.loads(archive.read(manifest_info).decode("utf-8"))
-            imported_db = json.loads(archive.read(db_info).decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError, RuntimeError) as exc:
-            raise ValueError("ملف وصف النسخة أو قاعدة البيانات غير صالح") from exc
-        if not isinstance(manifest, dict) or manifest.get("format") != "mazagi-full-backup-v1":
-            raise ValueError("إصدار النسخة الاحتياطية غير مدعوم")
-        if not isinstance(imported_db, dict):
-            raise ValueError("بنية قاعدة البيانات غير صالحة")
-        if not isinstance(imported_db.get("users"), dict) or not isinstance(imported_db.get("servers"), dict):
-            raise ValueError("قاعدة البيانات يجب أن تحتوي على المستخدمين والسيرفرات بصيغة صحيحة")
-        if not isinstance(imported_db.get("plans", {}), dict) or not isinstance(imported_db.get("logs", []), list):
-            raise ValueError("إعدادات الخطط أو السجلات في قاعدة البيانات غير صالحة")
-        if ADMIN_USERNAME not in imported_db["users"] or not isinstance(imported_db["users"].get(ADMIN_USERNAME), dict):
-            raise ValueError("النسخة لا تحتوي على حساب المسؤول المطلوب؛ أُلغيت الاستعادة لحماية الوصول للوحة الإدارة")
-        for username, user_data in imported_db["users"].items():
-            if not is_safe_username_component(username) or not isinstance(user_data, dict):
-                raise ValueError("تحتوي قاعدة البيانات على اسم مستخدم أو سجل غير صالح")
-        for folder, server in imported_db["servers"].items():
-            if not is_safe_username_component(folder) or not isinstance(server, dict):
-                raise ValueError("تحتوي قاعدة البيانات على سجل سيرفر غير صالح")
-            owner = server.get("owner")
-            if not is_safe_username_component(owner):
-                raise ValueError("تحتوي قاعدة البيانات على مالك سيرفر أو مسار غير صالح")
-        return normalized_infos, imported_db
-
-
-def _extract_backup_members(archive, normalized_infos, destination, *, skip_root_metadata=True):
-    """Extract previously inspected ZIP members without following symlinks or unsafe paths."""
-    os.makedirs(destination, exist_ok=True)
-    for info, rel, is_dir in normalized_infos:
-        if rel.casefold() == ".session_secret":
-            continue
-        if rel.replace("\\", "/").casefold() == INTERNAL_PRE_RESTORE_BACKUP.casefold():
-            continue
-        if skip_root_metadata and "/" not in rel and rel.casefold() in {FULL_BACKUP_MANIFEST.casefold(), FULL_BACKUP_README.casefold()}:
-            continue
-        parts = rel.split("/")
-        if any(part in ("", ".", "..") for part in parts):
-            raise ValueError("تم رفض مسار غير آمن أثناء فك الضغط")
-        target = os.path.abspath(os.path.join(destination, *parts))
-        base = os.path.abspath(destination)
-        if os.path.commonpath([base, target]) != base:
-            raise ValueError("تم رفض مسار خارج مجلد الاستعادة")
-        if is_dir:
-            os.makedirs(target, exist_ok=True)
-            continue
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        with archive.open(info, "r") as source, open(target, "xb") as output:
-            shutil.copyfileobj(source, output, length=1024 * 1024)
-
-
-def _snapshot_data_directory(data_root, target_archive):
-    """Create a rollback snapshot without secrets, symlinks or recursively stored rollback ZIPs."""
-    with zipfile.ZipFile(target_archive, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
-        for root, dirs, names in os.walk(data_root, followlinks=False):
-            dirs[:] = [name for name in dirs if not os.path.islink(os.path.join(root, name))]
-            for name in names:
-                full_path = os.path.join(root, name)
-                if os.path.islink(full_path) or name == ".session_secret" or name.endswith(".tmp") or ".replace_tmp" in name:
-                    continue
-                rel = os.path.relpath(full_path, data_root).replace(os.sep, "/")
-                if rel.replace("\\", "/").casefold() == INTERNAL_PRE_RESTORE_BACKUP.casefold():
-                    continue
-                if _normalize_backup_member_name(rel) is None:
-                    continue
-                archive.write(full_path, arcname=rel)
-
-
-def _clear_data_directory_preserving_session_secret(data_root):
-    """Remove current data entries without following links and preserve this deployment's session key."""
-    for name in os.listdir(data_root):
-        target = os.path.join(data_root, name)
-        if name == ".session_secret" and os.path.isfile(target) and not os.path.islink(target):
-            continue
-        if os.path.islink(target) or not os.path.isdir(target):
-            os.remove(target)
-        else:
-            shutil.rmtree(target)
-
-
-def _restore_snapshot_archive(snapshot_path):
-    """Restore the internally generated rollback snapshot into DATA_DIR."""
-    _clear_data_directory_preserving_session_secret(DATA_DIR)
-    with zipfile.ZipFile(snapshot_path, "r") as rollback_archive:
-        infos = []
-        seen = set()
-        for info in rollback_archive.infolist():
-            normalized = _normalize_backup_member_name(info.filename)
-            if normalized is None:
-                continue
-            rel = normalized.rstrip("/")
-            key = rel.casefold()
-            if key in seen:
-                continue
-            seen.add(key)
-            infos.append((info, rel, info.is_dir() or normalized.endswith("/")))
-        _extract_backup_members(rollback_archive, infos, DATA_DIR, skip_root_metadata=False)
-    os.makedirs(USERS_DIR, exist_ok=True)
-    os.makedirs(PHP_DIR, exist_ok=True)
-    return load_db()
-
-
-def _prepare_restored_database(imported_db):
-    """Relink server folders to this deployment and keep imported processes stopped until manually started."""
-    data = json.loads(json.dumps(imported_db, ensure_ascii=False))
-    default_plans = {
-        "free": {"name": "🎁 مجاني", "storage": 512000, "ram": 256, "cpu": 0.5, "max_servers": 2, "price": 0},
-        "4gb": {"name": "💎 4 جيجا", "storage": 4096000, "ram": 1024, "cpu": 1, "max_servers": 5, "price": 5},
-        "10gb": {"name": "💎 10 جيجا", "storage": 10240000, "ram": 2048, "cpu": 2, "max_servers": 10, "price": 10},
-        "40gb": {"name": "💎 40 جيجا", "storage": 40960000, "ram": 4096, "cpu": 4, "max_servers": 20, "price": 25}
-    }
-    data.setdefault("plans", {})
-    for plan_id, plan_data in default_plans.items():
-        data["plans"].setdefault(plan_id, plan_data)
-    data.setdefault("logs", [])
-    data["users"].setdefault(ADMIN_USERNAME, {})
-    data["users"][ADMIN_USERNAME]["is_admin"] = True
-    data["users"][ADMIN_USERNAME].setdefault("status", "approved")
-    if ADMIN_PASSWORD_OVERRIDE:
-        data["users"][ADMIN_USERNAME]["password"] = hashlib.sha256(ADMIN_PASSWORD_RAW.encode()).hexdigest()
-    for username, user_data in data["users"].items():
-        user_data.setdefault("max_files", 1000000 if user_data.get("is_admin") or username == ADMIN_USERNAME else 10)
-    for folder, server in data["servers"].items():
-        owner = server["owner"]
-        expected = _safe_server_dir(owner, folder)
-        if not expected:
-            raise ValueError("تعذر تكوين مسار آمن لأحد مشاريع النسخة الاحتياطية")
-        server["path"] = expected
-        server["status"] = "Stopped"
-        server["pid"] = None
-        server["port"] = None
-        server["start_time"] = None
-    return data
-
-
-@app.route('/api/admin/backup/restore', methods=['POST'])
-def admin_restore_full_backup():
-    """Restore a full Mazaji archive after validating it and preserving a rollback ZIP."""
-    global db
-    if not _check_admin_access():
-        return jsonify({"success": False, "message": "غير مصرح"}), 403
-
-    uploaded = request.files.get("backup_file") or request.files.get("file")
-    if not uploaded or not uploaded.filename:
-        return jsonify({"success": False, "message": "اختر ملف ZIP للنسخة الاحتياطية أولاً"}), 400
-
-    temp_base = tempfile.mkdtemp(prefix="mazagi_full_restore_")
-    upload_path = os.path.join(temp_base, "uploaded_backup.zip")
-    staging = os.path.join(temp_base, "staging")
-    snapshot_path = os.path.join(temp_base, "before_restore.zip")
-    old_db_reference = db
-    try:
-        uploaded.save(upload_path)
-        archive_size = os.path.getsize(upload_path)
-        if archive_size <= 0 or archive_size > MAX_FULL_BACKUP_ARCHIVE_BYTES:
-            raise ValueError("حجم ملف ZIP غير صالح أو أكبر من 500 ميجابايت")
-
-        normalized_infos, imported_db = _inspect_full_backup_zip(upload_path)
-        with zipfile.ZipFile(upload_path, "r") as archive:
-            _extract_backup_members(archive, normalized_infos, staging)
-
-        restored_db = _prepare_restored_database(imported_db)
-        # Make sure required roots exist even when a valid backup contains no user project files.
-        os.makedirs(os.path.join(staging, "USERS"), exist_ok=True)
-        os.makedirs(os.path.join(staging, "php_files"), exist_ok=True)
-        # Normalize imported database with portable relative deployment paths before commit.
-        staged_db = os.path.join(staging, "db.json")
-        with open(staged_db, "w", encoding="utf-8") as output:
-            json.dump(restored_db, output, ensure_ascii=False, indent=4)
-            output.flush()
-            os.fsync(output.fileno())
-
-        # Stop existing hosted projects before replacing their files.
-        for folder, server in list(db.get("servers", {}).items()):
-            if server.get("pid") or server.get("status") in ("Running", "Starting"):
-                try:
-                    stop_server_process(folder)
-                except Exception as stop_exc:
-                    print(f"⚠️ تعذر إيقاف السيرفر {folder} قبل الاستعادة: {stop_exc}", flush=True)
-
-        # Keep a rollback archive outside DATA_DIR so it cannot be included in itself.
-        _snapshot_data_directory(DATA_DIR, snapshot_path)
-        os.makedirs(DATA_DIR, exist_ok=True)
-        _clear_data_directory_preserving_session_secret(DATA_DIR)
-        for name in os.listdir(staging):
-            source = os.path.join(staging, name)
-            target = os.path.join(DATA_DIR, name)
-            if os.path.isdir(source) and not os.path.islink(source):
-                shutil.copytree(source, target, symlinks=False)
-            elif os.path.isfile(source) and not os.path.islink(source):
-                shutil.copy2(source, target)
-        os.makedirs(USERS_DIR, exist_ok=True)
-        os.makedirs(PHP_DIR, exist_ok=True)
-        db = restored_db
-        if not save_db(db):
-            raise RuntimeError("تعذر حفظ قاعدة البيانات بعد الاستعادة")
-        # Persist one rollback point, while excluding that same archive from future full exports.
-        rollback_dir = os.path.join(DATA_DIR, "backups")
-        os.makedirs(rollback_dir, exist_ok=True)
-        rollback_target = os.path.join(DATA_DIR, INTERNAL_PRE_RESTORE_BACKUP)
-        shutil.copy2(snapshot_path, rollback_target)
-        return jsonify({
-            "success": True,
-            "message": "تمت استعادة قاعدة البيانات وملفات المستخدمين والمشاريع بنجاح. جميع السيرفرات المستعادة متوقفة حتى تشغّلها يدويًا.",
-            "users_restored": len(db.get("users", {})),
-            "servers_restored": len(db.get("servers", {})),
-            "rollback_backup": "backups/pre_restore_latest.zip"
-        }), 200
-    except ValueError as exc:
-        if os.path.isfile(snapshot_path):
-            try:
-                db = _restore_snapshot_archive(snapshot_path)
-            except Exception as rollback_exc:
-                db = old_db_reference
-                print(f"🚨 فشلت الاستعادة التلقائية بعد خطأ التحقق: {rollback_exc}", flush=True)
-                return jsonify({"success": False, "message": "حدث خطأ أثناء الاستعادة وتعذرت إعادة البيانات السابقة تلقائيًا. راجع سجل الاستضافة فورًا ولا تحذف Volume."}), 500
-        return jsonify({"success": False, "message": str(exc)}), 400
-    except Exception as exc:
-        print(f"❌ فشلت استعادة نسخة مزاجي الاحتياطية: {exc}", flush=True)
-        if os.path.isfile(snapshot_path):
-            try:
-                db = _restore_snapshot_archive(snapshot_path)
-            except Exception as rollback_exc:
-                db = old_db_reference
-                print(f"🚨 فشلت استعادة النسخة السابقة تلقائيًا: {rollback_exc}", flush=True)
-                return jsonify({"success": False, "message": "فشلت الاستعادة، وتعذرت الاستعادة التلقائية للبيانات السابقة. لا تعاود النشر أو حذف Volume؛ راجع سجل الاستضافة فورًا."}), 500
-        else:
-            db = old_db_reference
-        return jsonify({"success": False, "message": f"فشلت الاستعادة، وأُعيدت البيانات السابقة إن كانت قد تغيّرت: {str(exc)[:300]}"}), 500
-    finally:
-        shutil.rmtree(temp_base, ignore_errors=True)
-
-
 @app.route('/api/admin/backup/full')
 def admin_download_full_backup():
     """Export the whole persistent Mazaji data directory for a controlled migration."""
@@ -3692,14 +3489,12 @@ def admin_download_full_backup():
     try:
         with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
             for root, dirs, names in os.walk(data_root, followlinks=False):
-                dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d)) and d not in {"__pycache__", ".pytest_cache", ".mypy_cache"}]
+                dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d)) and d not in {".venv", "venv", "node_modules", ".git", "__pycache__", ".pytest_cache", ".mypy_cache"}]
                 for name in names:
                     full_path = os.path.join(root, name)
                     if os.path.islink(full_path) or name == ".session_secret" or name.endswith(".tmp") or ".replace_tmp" in name:
                         continue
                     rel = os.path.relpath(full_path, data_root).replace(os.sep, "/")
-                    if rel.casefold() == INTERNAL_PRE_RESTORE_BACKUP.casefold():
-                        continue
                     if rel == "":
                         continue
                     archive.write(full_path, arcname=rel)
@@ -3709,7 +3504,7 @@ def admin_download_full_backup():
                 "تتضمن db.json (حسابات المستخدمين وإعدادات الخطط وبيانات السيرفرات المحفوظة بالمنصة) ومجلدات USERS وphp_files وأي نسخ احتياطية محفوظة داخل DATA_DIR.\n"
                 "تشمل ملفات مشاريع/بوتات المستخدمين الموجودة داخل USERS. إذا كان ملف قاعدة بيانات البوت داخل مجلد مشروعه فسيكون ضمن النسخة.\n"
                 "لا تتضمن هذه الحزمة مفتاح الجلسة .session_secret؛ سيتم إنشاء مفتاح جديد عند التشغيل وقد تحتاج الحسابات إلى تسجيل الدخول مجددًا.\n"
-                "للترحيل: انشر التطبيق على الاستضافة الجديدة، واربط التخزين الدائم عند الحاجة، ثم افتح لوحة الإدارة واختر (استعادة قاعدة البيانات) وارفع هذا الملف. الاستعادة تعيد مسارات المشاريع تلقائيًا وتتركها متوقفة إلى حين تشغيلها يدويًا. يمكن فك ZIP يدويًا فقط بعد أخذ نسخة مستقلة من بيانات الهدف.\n"
+                "للترحيل: أوقف التطبيق الهدف وخذ نسخة من بياناته الحالية، ثم استخرج محتويات ZIP مباشرة إلى جذر DATA_DIR. على Railway اربط Volume على /data واستخرج المحتويات بحيث يصبح db.json في /data/db.json وUSERS في /data/USERS.\n"
                 "لا تستخرج فوق بيانات موجودة دون نسخة احتياطية منفصلة. هذه الحزمة حساسة وقد تحتوي على كلمات مرور مشفرة ومفاتيح API وملفات مشروع سرية؛ لا تشاركها.\n"
             )
             archive.writestr("MAZAGI_FULL_BACKUP_README_AR.txt", readme)
@@ -3725,12 +3520,244 @@ def admin_download_full_backup():
                     {"path": "backups/", "display_name": "النسخ الاحتياطية السابقة", "description": "نسخ قاعدة البيانات التي تحتفظ بها المنصة إن وُجدت."}
                 ]
             }, ensure_ascii=False, indent=2))
-        response = send_file(archive_path, as_attachment=True, download_name="قاعدة_بيانات_مزاجي_الكاملة.zip")
+        response = send_file(archive_path, as_attachment=True, download_name="Mazaji_Full_Backup.zip")
         response.call_on_close(lambda: shutil.rmtree(temp_base, ignore_errors=True))
         return response
     except Exception as exc:
         shutil.rmtree(temp_base, ignore_errors=True)
         return jsonify({"success": False, "message": f"تعذر إنشاء النسخة الاحتياطية: {exc}"}), 500
+
+
+@app.route('/api/admin/backup/restore', methods=['POST'])
+def admin_restore_full_backup():
+    """Restore an archive created by /api/admin/backup/full with validation and rollback."""
+    global db
+    if not _check_admin_access():
+        return jsonify({"success": False, "message": "غير مصرح"}), 403
+    uploaded = request.files.get('file')
+    if not uploaded or not uploaded.filename:
+        return jsonify({"success": False, "message": "اختر ملف النسخة الاحتياطية ZIP أولاً"}), 400
+    if not str(uploaded.filename).lower().endswith('.zip'):
+        return jsonify({"success": False, "message": "الملف يجب أن يكون ZIP"}), 400
+
+    transaction_name = ".mazagi-restore-" + secrets.token_hex(8)
+    transaction_dir = os.path.join(os.path.realpath(DATA_DIR), transaction_name)
+    new_root = os.path.join(transaction_dir, "new")
+    old_root = os.path.join(transaction_dir, "old")
+    moved_old = []
+    installed_new = []
+    original_db_after_stopping = None
+    backup_filename = ""
+    allowed_root_names = {"db.json", "USERS", "php_files", "backups"}
+    max_entries = 1_000_000
+    max_uncompressed = 50 * 1024 * 1024 * 1024  # guard against zip bombs; actual disk limits still apply
+
+    def safe_archive_parts(raw_name):
+        normalized = str(raw_name or "").replace("\\", "/")
+        if not normalized or normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized) or "\x00" in normalized:
+            raise ValueError("الأرشيف يحتوي مسارًا غير آمن")
+        raw_parts = normalized.split("/")
+        parts = [part for part in raw_parts if part not in ("", ".")]
+        if not parts or any(part == ".." for part in parts):
+            raise ValueError("الأرشيف يحاول الكتابة خارج مجلد البيانات")
+        if parts[0].casefold() == ".session_secret" or parts[0].casefold().startswith(".mazagi-restore-"):
+            raise ValueError("الأرشيف يحتوي ملفًا داخليًا محجوزًا")
+        if parts[0] not in allowed_root_names and parts[0].casefold() not in {"mazagi_full_backup_manifest.json", "mazagi_full_backup_readme_ar.txt"}:
+            raise ValueError(f"الأرشيف ليس نسخة مزاجي كاملة معروفة أو أن حالة اسم المجلد غير مطابقة: {parts[0]}")
+        return parts
+
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        os.makedirs(new_root, exist_ok=False)
+        manifest = None
+        with zipfile.ZipFile(uploaded.stream, 'r') as archive:
+            archive_infos = archive.infolist()
+            if len(archive_infos) > max_entries:
+                raise ValueError("عدد عناصر ZIP كبير وغير آمن")
+
+            # Check declared expanded size and metadata before testzip() reads/decompresses payloads.
+            declared_total = sum(max(0, int(info.file_size or 0)) for info in archive_infos)
+            if declared_total > max_uncompressed:
+                raise ValueError("الحجم بعد فك الضغط يتجاوز الحد الوقائي البالغ 50 جيجابايت")
+            preflight_seen = set()
+            for info in archive_infos:
+                preflight_parts = safe_archive_parts(info.filename)
+                preflight_key = "/".join(preflight_parts).casefold()
+                if preflight_key in preflight_seen:
+                    raise ValueError(f"الأرشيف يحتوي مسارًا مكررًا: {'/'.join(preflight_parts)}")
+                preflight_seen.add(preflight_key)
+                preflight_mode = (info.external_attr >> 16) & 0xFFFF
+                if (preflight_mode & 0o170000) == 0o120000:
+                    raise ValueError("روابط الملفات الرمزية غير مسموحة داخل نسخة الاستعادة")
+
+            broken = archive.testzip()
+            if broken:
+                raise ValueError(f"ملف ZIP تالف عند العنصر: {broken}")
+            manifest_info = next((x for x in archive_infos if x.filename.replace("\\", "/").strip("/").casefold() == "mazagi_full_backup_manifest.json"), None)
+            if manifest_info is None or manifest_info.file_size > 2 * 1024 * 1024:
+                raise ValueError("هذه ليست نسخة كاملة صادرة من مزاجي (ملف تعريف النسخة غير موجود)")
+            try:
+                manifest = json.loads(archive.read(manifest_info).decode("utf-8"))
+            except Exception as exc:
+                raise ValueError("تعذر قراءة تعريف النسخة الاحتياطية") from exc
+            if not isinstance(manifest, dict) or manifest.get("format") != "mazagi-full-backup-v1":
+                raise ValueError("صيغة النسخة غير مدعومة؛ نزّل نسخة كاملة جديدة من لوحة مزاجي")
+
+            seen = set()
+            total_uncompressed = 0
+            for info in archive.infolist():
+                parts = safe_archive_parts(info.filename)
+                if parts[0] in {"MAZAGI_FULL_BACKUP_MANIFEST.json", "MAZAGI_FULL_BACKUP_README_AR.txt"}:
+                    continue
+                target_key = "/".join(parts).casefold()
+                if target_key in seen:
+                    raise ValueError(f"الأرشيف يحتوي مسارًا مكررًا: {'/'.join(parts)}")
+                seen.add(target_key)
+                mode = (info.external_attr >> 16) & 0xFFFF
+                if (mode & 0o170000) == 0o120000:
+                    raise ValueError("روابط الملفات الرمزية غير مسموحة داخل نسخة الاستعادة")
+                total_uncompressed += int(info.file_size or 0)
+                if total_uncompressed > max_uncompressed:
+                    raise ValueError("الحجم بعد فك الضغط يتجاوز الحد الوقائي البالغ 50 جيجابايت")
+                target = os.path.abspath(os.path.join(new_root, *parts))
+                if os.path.commonpath([os.path.abspath(new_root), target]) != os.path.abspath(new_root):
+                    raise ValueError("مسار داخل ZIP خارج مجلد الاستعادة")
+                if info.is_dir():
+                    os.makedirs(target, exist_ok=True)
+                    continue
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with archive.open(info, "r") as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst, length=1024 * 1024)
+
+        staged_db_path = os.path.join(new_root, "db.json")
+        if not os.path.isfile(staged_db_path):
+            raise ValueError("النسخة لا تحتوي db.json — لم تُمس البيانات الحالية")
+        try:
+            with open(staged_db_path, "r", encoding="utf-8-sig") as handle:
+                restored_db = json.load(handle)
+        except Exception as exc:
+            raise ValueError("قاعدة البيانات داخل ZIP غير صالحة أو تالفة") from exc
+        if not isinstance(restored_db, dict) or not isinstance(restored_db.get("users"), dict) or not isinstance(restored_db.get("servers"), dict):
+            raise ValueError("بنية db.json غير مكتملة؛ يجب أن تحتوي users وservers")
+        if not isinstance(restored_db.get("plans", {}), dict):
+            raise ValueError("بيانات الخطط داخل db.json غير صالحة")
+        restored_db.setdefault("plans", db.get("plans", {}))
+        restored_db.setdefault("logs", [])
+
+        # The current server's paths can differ from the source server's paths; rebase them safely.
+        for server_id, server in restored_db.get("servers", {}).items():
+            if not isinstance(server_id, str) or not isinstance(server, dict):
+                raise ValueError("قائمة السيرفرات داخل قاعدة البيانات غير صالحة")
+            owner = server.get("owner")
+            if not is_safe_username_component(owner) or not is_safe_username_component(server_id):
+                raise ValueError(f"مسار سيرفر غير آمن داخل قاعدة البيانات: {server_id}")
+            data_base = os.path.abspath(DATA_DIR)
+            expected = os.path.abspath(os.path.join(data_base, "USERS", owner, "SERVERS", server_id))
+            if os.path.commonpath([data_base, expected]) != data_base:
+                raise ValueError(f"مسار سيرفر خارج بيانات المنصة: {server_id}")
+            server["path"] = expected
+            server["status"] = "Stopped"
+            server["pid"] = None
+
+        for required_dir in ("USERS", "php_files", "backups"):
+            os.makedirs(os.path.join(new_root, required_dir), exist_ok=True)
+        with open(staged_db_path, "w", encoding="utf-8") as handle:
+            json.dump(restored_db, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        # Stop existing processes before switching their files. Failures to stop are logged but do not bypass rollback protection.
+        for existing_id, existing_server in list(db.get("servers", {}).items()):
+            if isinstance(existing_server, dict) and (existing_server.get("pid") or existing_server.get("status") == "Running"):
+                try:
+                    stop_server_process(existing_id)
+                except Exception as stop_exc:
+                    print(f"⚠️ تعذر إيقاف السيرفر {existing_id} قبل الاستعادة: {stop_exc}", flush=True)
+        try:
+            original_db_after_stopping = json.loads(json.dumps(db, ensure_ascii=False))
+        except Exception:
+            original_db_after_stopping = db
+
+        os.makedirs(old_root, exist_ok=True)
+        targets = ("db.json", "USERS", "php_files", "backups")
+        data_real = os.path.realpath(DATA_DIR)
+        for target_name in targets:
+            current_path = os.path.join(data_real, target_name)
+            if os.path.lexists(current_path):
+                os.replace(current_path, os.path.join(old_root, target_name))
+                moved_old.append(target_name)
+        for target_name in targets:
+            staged_path = os.path.join(new_root, target_name)
+            final_path = os.path.join(data_real, target_name)
+            os.replace(staged_path, final_path)
+            installed_new.append(target_name)
+
+        # Record a full copy of the pre-restore state inside the restored backups folder.
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_filename = f"pre_restore_{stamp}.zip"
+        backup_temp = os.path.join(transaction_dir, backup_filename)
+        with zipfile.ZipFile(backup_temp, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as backup_archive:
+            for target_name in targets:
+                source = os.path.join(old_root, target_name)
+                if not os.path.exists(source):
+                    continue
+                if os.path.isfile(source):
+                    backup_archive.write(source, arcname=target_name)
+                    continue
+                for root, dirs, names in os.walk(source, followlinks=False):
+                    dirs[:] = [d for d in dirs if d not in {".venv", "venv", "node_modules", ".git", "__pycache__", ".pytest_cache", ".mypy_cache"} and not os.path.islink(os.path.join(root, d))]
+                    for filename in names:
+                        full_path = os.path.join(root, filename)
+                        if os.path.islink(full_path) or filename in {".session_secret"}:
+                            continue
+                        # Recovery snapshots are intentionally not nested inside the next recovery snapshot.
+                        # This prevents pre_restore ZIP files from recursively growing with every restore.
+                        if target_name == "backups" and filename.startswith("pre_restore_") and filename.lower().endswith(".zip"):
+                            continue
+                        rel_under_target = os.path.relpath(full_path, source)
+                        rel_path = target_name if rel_under_target == "." else target_name + "/" + rel_under_target.replace(os.sep, "/")
+                        backup_archive.write(full_path, arcname=rel_path)
+        os.replace(backup_temp, os.path.join(data_real, "backups", backup_filename))
+
+        db = restored_db
+        if not save_db(db):
+            raise RuntimeError("تعذر حفظ قاعدة البيانات المستعادة")
+        shutil.rmtree(transaction_dir, ignore_errors=True)
+        return jsonify({
+            "success": True,
+            "message": f"تمت استعادة قاعدة البيانات وملفات المستخدمين بنجاح. توقفت المشاريع وتحتاج تشغيلها يدويًا. حُفظت نسخة ما قبل الاستعادة في backups/{backup_filename}.",
+            "backup_file": backup_filename,
+            "users": len(db.get("users", {})),
+            "servers": len(db.get("servers", {}))
+        })
+    except Exception as exc:
+        # Roll back every root switched so far. The transaction folder is on the same volume for atomic os.replace.
+        data_real = os.path.realpath(DATA_DIR)
+        for target_name in reversed(installed_new):
+            current_path = os.path.join(data_real, target_name)
+            if os.path.isdir(current_path) and not os.path.islink(current_path):
+                shutil.rmtree(current_path, ignore_errors=True)
+            elif os.path.lexists(current_path):
+                try:
+                    os.remove(current_path)
+                except OSError:
+                    pass
+        for target_name in reversed(moved_old):
+            previous_path = os.path.join(old_root, target_name)
+            final_path = os.path.join(data_real, target_name)
+            if os.path.lexists(previous_path):
+                try:
+                    os.replace(previous_path, final_path)
+                except OSError as rollback_exc:
+                    print(f"❌ فشل إرجاع {target_name} أثناء التراجع: {rollback_exc}", flush=True)
+        if original_db_after_stopping is not None:
+            db = original_db_after_stopping
+            try:
+                save_db(db)
+            except Exception:
+                pass
+        shutil.rmtree(transaction_dir, ignore_errors=True)
+        return jsonify({"success": False, "message": f"فشلت الاستعادة وتمت محاولة إرجاع البيانات السابقة: {exc}"}), 400
 
 
 @app.route('/api/admin/server/download-all/<folder>')
